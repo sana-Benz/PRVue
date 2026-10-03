@@ -1,0 +1,9 @@
+# Mémoire de Terraform : peut contenir des secrets
+*.tfstate
+*.tfstate.*
+
+# Providers téléchargés par terraform init
+.terraform/
+
+# Fichiers de variables : peuvent contenir des secrets
+*.tfvars
