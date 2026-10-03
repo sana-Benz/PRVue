@@ -91,6 +91,60 @@ Système : Ubuntu 24.04, x86_64.
 kind version; terraform version | head -1; helm version --short; gh --version | head -1; kubectl version --client | head -1; gh auth status
 ```
 
+## Fait le 2026-10-03
+
+### 4. Création du dépôt PRVue
+
+- Dépôt GitHub `sana-Benz/PRVue`, **privé pour l'instant**. À passer en public quand il sera présentable (visibilité pour les recruteurs, et ruleset appliqué gratuitement seulement sur les dépôts publics).
+- Le guide du projet a été renommé `GUIDE.md` : `README.md` sera la vitrine finale du projet.
+- `.gitignore` : `*.tfstate`, `*.tfstate.*`, `.terraform/`, `*.tfvars`. Le state Terraform et les fichiers de variables peuvent contenir des secrets.
+
+```bash
+git init -b main
+git remote add origin git@github.com:sana-Benz/PRVue.git
+git pull origin main
+```
+
+### 5. Choix : local d'abord, Azure à la fin
+
+- Terraform ne sert pas qu'au cloud : il pilote tout ce qui a un **provider** (kind, Azure, GitHub, Datadog…).
+- Tout est construit en **local avec kind** : gratuit, sans limite, et les erreurs sont sans conséquence.
+- Le **crédit Azure étudiant (100 $)** est gardé pour la fin (extension 4 du guide) : on remplacera seulement la ressource du cluster (`kind_cluster` → `azurerm_kubernetes_cluster`) pour une démo, puis on détruira tout le jour même. Ne pas l'activer avant.
+
+### 6. Le cluster kind en Terraform
+
+Fichiers dans `platform/terraform/` :
+
+| Fichier | Rôle |
+| --- | --- |
+| `providers.tf` | Déclare le provider `tehcyx/kind`, version `~> 0.11` (toute version 0.11.x) |
+| `cluster.tf` | Décrit le cluster `previews` : 1 node control-plane, et le port 80 du laptop relié au port 30080 du node |
+
+```bash
+cd platform/terraform
+terraform init       # télécharge le provider
+terraform plan       # "Plan: 1 to add" → va créer le cluster
+terraform apply      # crée le cluster
+terraform apply      # relancé : "No changes", le cluster existe déjà
+terraform destroy    # supprime tout
+terraform apply      # recrée à l'identique
+```
+
+- **`extra_port_mappings`** : le node est une boîte Docker fermée. On « perce un trou » entre le port 80 du laptop et le port 30080 du node, où écoutera Traefik. Visible avec `docker ps` : `0.0.0.0:80->30080/tcp`.
+- **Terraform décrit un résultat** : relancer `apply` ne recrée pas le cluster. À la main, `kind create cluster` aurait donné une erreur « already exists ».
+
+**Fichiers générés par Terraform :**
+
+| Fichier | Sur GitHub ? | Pourquoi |
+| --- | --- | --- |
+| `.terraform/` | ❌ | Providers téléchargés, lourds et re-téléchargeables |
+| `terraform.tfstate` (+ `.backup`) | ❌ | La mémoire de Terraform, peut contenir des secrets |
+| `.terraform.lock.hcl` | ✅ | Fige la version exacte des providers : tout le monde utilise les mêmes |
+| `previews-config` | ❌ | Kubeconfig créé par le provider kind = **clé d'accès au cluster**. Ajouté au `.gitignore` (`*-config`) |
+| `.terraform.tfstate.lock.info` | ❌ | Verrou temporaire pendant un `apply`, disparaît tout seul |
+
+**À retenir :** toujours lancer `git status` avant un commit pour vérifier qu'aucun fichier sensible ne part sur GitHub.
+
 ---
 
 ## Concepts compris
@@ -102,6 +156,13 @@ kind version; terraform version | head -1; helm version --short; gh --version | 
   ```
 - **kind remplace Minikube** : même rôle (un cluster local), mais il est plus léger et se pilote bien avec Terraform. Ne pas faire tourner les deux en même temps (`minikube stop`).
 - **Ingress ≠ Ingress Controller** : l'Ingress contient les règles de routage (YAML), le controller est le programme qui les applique. On garde l'Ingress, et on remplace seulement le controller **Nginx Ingress** (projet arrêté par Kubernetes, plus mis à jour depuis mars 2026) par **Traefik**.
+- **Fichiers à ne jamais pousser** :
+  - Terraform : `terraform.tfstate` (+ `.backup`, contient tout en clair, secrets compris), `*.tfvars` (valeurs des variables).
+  - Kubernetes : kubeconfig (`~/.kube/config`, `previews-config`, accès complet au cluster), fichiers `Secret` (le base64 n'est **pas** un chiffrement), clés privées et certificats (`*.key`, `*.pem`).
+  - En général : `.env`, clé SSH privée (sans `.pub`), tokens (`gho_...`, clé Datadog).
+  - Le `.gitignore` agit seulement **avant** le commit : un secret déjà poussé doit être considéré comme volé et **changé**.
+  - Toujours `git status` avant `git add`. Vérifier une règle : `git check-ignore -v <fichier>`.
+- **Gitleaks (idée ajoutée)** : détecteur de secrets, en hook local + en CI. Avec le `.gitignore`, ça fait trois couches = défense en profondeur.
 - **Terraform ≠ YAML Kubernetes** : le YAML décrit ce qui tourne *dans* le cluster, Terraform décrit le cluster *lui-même* et ce qu'on installe dessus. MicroPizzeria n'utilisait pas Terraform (installation à la main avec `minikube` + `deploy.sh`).
 
 ---
@@ -117,4 +178,8 @@ kind version; terraform version | head -1; helm version --short; gh --version | 
   docker ps                      # le nœud est un conteneur Docker
   kind delete cluster --name test
   ```
-- [ ] Étape 1 du README : écrire ce cluster en Terraform, avec Traefik et ArgoCD
+- [x] Créer le dépôt PRVue et son `.gitignore`
+- [x] Étape 1 du guide, partie 1 : écrire le cluster kind seul en Terraform
+- [ ] Étape 1 du guide, partie 2 : ajouter Traefik et ArgoCD
+- [ ] Gitleaks : hook pre-commit local (après l'étape 1)
+- [ ] Gitleaks : job de CI dans PRVue et MicroPizzeria (étape 3)

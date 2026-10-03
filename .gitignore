@@ -7,3 +7,6 @@
 
 # Fichiers de variables : peuvent contenir des secrets
 *.tfvars
+
+# Kubeconfig généré par le provider kind : clé d'accès au cluster
+*-config
