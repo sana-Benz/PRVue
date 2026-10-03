@@ -104,13 +104,13 @@ Objectif : `terraform apply` crée le cluster kind et y installe Traefik et Argo
 # platform/terraform/providers.tf
 terraform {
   required_providers {
-    kind       = { source = "tehcyx/kind", version = "~> 0.9" }
-    helm       = { source = "hashicorp/helm", version = "~> 2.17" }
-    kubernetes = { source = "hashicorp/kubernetes", version = "~> 2.35" }
+    kind       = { source = "tehcyx/kind", version = "~> 0.11" }
+    helm       = { source = "hashicorp/helm", version = "~> 3.3" }
+    kubernetes = { source = "hashicorp/kubernetes", version = "~> 3.3" }   # utile à partir de l'étape 4
   }
 }
 
-provider "kubernetes" {
+provider "kubernetes" {   # utile à partir de l'étape 4
   host                   = kind_cluster.this.endpoint
   client_certificate     = kind_cluster.this.client_certificate
   client_key             = kind_cluster.this.client_key
@@ -118,7 +118,7 @@ provider "kubernetes" {
 }
 
 provider "helm" {
-  kubernetes {
+  kubernetes = {
     host                   = kind_cluster.this.endpoint
     client_certificate     = kind_cluster.this.client_certificate
     client_key             = kind_cluster.this.client_key
@@ -127,7 +127,7 @@ provider "helm" {
 }
 ```
 
-Les numéros de version sont des points de départ : vérifie les dernières versions sur le Terraform Registry. La syntaxe du provider Helm change en version 3, donc ne mélange pas les exemples des deux versions.
+Versions vérifiées le 2026-10-03. Attention : en version 3 du provider Helm, on écrit `kubernetes = {` **avec un `=`**. Beaucoup d'exemples sur Internet utilisent encore l'ancienne syntaxe `kubernetes {`, sans `=`, qui ne fonctionne plus.
 
 ### Cluster kind
 
@@ -148,6 +148,7 @@ resource "kind_cluster" "this" {
       extra_port_mappings {
         container_port = 30080
         host_port      = 80
+        listen_address = "127.0.0.1"   # joignable seulement depuis le laptop, pas depuis le Wi-Fi
       }
     }
   }
@@ -162,8 +163,10 @@ resource "helm_release" "traefik" {
   name             = "traefik"
   repository       = "https://traefik.github.io/charts"
   chart            = "traefik"
+  version          = "41.6.1"
   namespace        = "traefik"
   create_namespace = true
+  timeout          = 600
   values           = [file("${path.module}/values/traefik.yaml")]
 }
 
@@ -171,8 +174,10 @@ resource "helm_release" "argocd" {
   name             = "argocd"
   repository       = "https://argoproj.github.io/argo-helm"
   chart            = "argo-cd"
+  version          = "10.9.6"
   namespace        = "argocd"
   create_namespace = true
+  timeout          = 600   # la première installation télécharge beaucoup d'images
   values           = [file("${path.module}/values/argocd.yaml")]
 }
 ```
@@ -182,7 +187,8 @@ resource "helm_release" "argocd" {
 deployment:
   replicas: 1
 service:
-  type: NodePort
+  spec:
+    type: NodePort      # dans les charts récents, sous service.spec (et non service.type)
 ports:
   web:
     nodePort: 30080
@@ -194,7 +200,7 @@ dex:
   enabled: false        # pas de SSO : économise de la RAM
 ```
 
-Épingle la version de chaque chart avec l'argument `version` une fois que tout fonctionne.
+Les versions des charts sont épinglées avec l'argument `version`. Avant de changer de version, vérifie les options disponibles avec `helm show values <chart> --version <x>` : les options changent de place d'une version à l'autre, et Helm **ignore sans prévenir** une option mal placée. Avec le type `LoadBalancer` (la valeur par défaut de Traefik), le Service attend pour toujours une IP externe que kind ne fournit pas, et `terraform apply` échoue sur `context deadline exceeded`.
 
 ### Lancer
 
