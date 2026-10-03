@@ -401,6 +401,8 @@ Trois points de sécurité, à citer en entretien :
 - **Les PR venues de forks** n'obtiennent pas de jeton en écriture : leurs images ne sont pas publiées, et c'est voulu.
 - **Les exceptions Checkov ou Trivy** se documentent dans le code, avec une justification, jamais en désactivant le scan.
 
+**Détection de secrets avec Gitleaks** : un job `secret-scan` analyse chaque PR avec Gitleaks et bloque le pipeline si un secret (token, clé, mot de passe) est détecté. Ajoute-le dans les deux dépôts, PRVue et MicroPizzeria. En complément, un hook *pre-commit* local bloque le commit avant même qu'il quitte le laptop. Avec le `.gitignore`, cela fait trois couches de protection : c'est la **défense en profondeur**.
+
 Rends les images publiques dans les réglages de packages GitHub, pour que le cluster puisse les tirer sans identifiants.
 
 **Terminé quand**
@@ -408,6 +410,7 @@ Rends les images publiques dans les réglages de packages GitHub, pour que le cl
 - [ ] Une vulnérabilité volontaire, par exemple une vieille image de base, fait échouer le pipeline
 - [ ] Une erreur Terraform volontaire fait échouer Checkov
 - [ ] Les actions sont épinglées par SHA
+- [ ] Un faux token volontairement ajouté fait échouer le job Gitleaks
 
 ---
 
