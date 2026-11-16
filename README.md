@@ -2,7 +2,7 @@
 
 **An ephemeral preview environment for every pull request.**
 
-PRVue is a platform that automatically spins up a complete, isolated copy of the [MicroPizzeria](https://github.com/sana-Benz/MicroPizzeria) application in Kubernetes for each of its pull requests. The copy is health-checked, monitored, and deleted when the PR is closed.
+PRVue is a platform that automatically spins up a complete, isolated copy of the [MicroPizzeria](https://github.com/sana-Benz/MicroPizzeria) application in Kubernetes for each of its pull requests. The copy is updated on every new commit and deleted when the PR is closed. Health checks and monitoring are planned for a later phase.
 
 > 🚧 **Work in progress.** See the [project status](#project-status).
 
