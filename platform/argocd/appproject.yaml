@@ -1,0 +1,45 @@
+# Fence around the previews: what the generated Applications are allowed to deploy, and where.
+# Argo CD refuses the whole sync if a single resource breaks a rule (tested 2026-11-16).
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: previews
+  namespace: argocd
+spec:
+  description: MicroPizzeria pull request previews, one namespace pr-<number> per PR
+
+  # manifests can only come from the application repository
+  sourceRepos:
+    - https://github.com/sana-Benz/MicroPizzeria.git
+
+  # every namespaced resource must be in a pr-* namespace (checked per resource, not only the destination)
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: "pr-*"
+
+  # the only cluster-scoped resource allowed: the preview's own Namespace, named pr-*
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+      name: "pr-*"
+
+  # only the kinds MicroPizzeria uses (from the rendered manifests); a new kind needs a change here
+  namespaceResourceWhitelist:
+    - group: ""
+      kind: ServiceAccount
+    - group: ""
+      kind: Secret
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: PersistentVolumeClaim
+    - group: apps
+      kind: Deployment
+    - group: rbac.authorization.k8s.io
+      kind: Role
+    - group: rbac.authorization.k8s.io
+      kind: RoleBinding
+    - group: networking.k8s.io
+      kind: Ingress
+    - group: traefik.io
+      kind: Middleware
