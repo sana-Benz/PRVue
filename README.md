@@ -7,6 +7,12 @@ PRVue is a platform that automatically spins up a complete, isolated copy of the
 > 🚧 **Work in progress.** See the [project status](#project-status).
 
 ---
+MVP
+
+
+https://github.com/user-attachments/assets/dfcc7ff6-1cc6-4af8-918b-625a0db1dabf
+
+
 
 ## The problem
 
