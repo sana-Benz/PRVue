@@ -1,141 +1,109 @@
 # PRVue
 
-**An ephemeral preview environment for every pull request.**
+**An ephemeral Kubernetes preview environment for every pull request.**
 
-PRVue is a platform that automatically spins up a complete, isolated copy of the [MicroPizzeria](https://github.com/sana-Benz/MicroPizzeria) application in Kubernetes for each of its pull requests. The copy is updated on every new commit and deleted when the PR is closed. Health checks and monitoring are planned for a later phase.
-
-> 🚧 **Work in progress.** See the [project status](#project-status).
-
----
-MVP
-
+## Demo
 
 https://github.com/user-attachments/assets/dfcc7ff6-1cc6-4af8-918b-625a0db1dabf
 
+Open a pull request → its own preview environment is created automatically → close the pull request → the environment is deleted.
 
-
-## The problem
-
-When someone proposes a change to an application, the team wants to **see it running** before merging it. Without tooling, that version has to be deployed somewhere by hand: it is slow, error-prone, and test versions end up stepping on each other.
-
-## The solution
-
-With PRVue, you only need to open a pull request:
-
-1. CI builds the three application images (`frontend`, `user-service`, `order-service`) from the PR's head commit and publishes them to GHCR, tagged `pr-<number>-<first 8 chars of the commit SHA>`. Once all three builds succeed, it adds the `preview-ready` label to the PR. *(Planned after the MVP: blocking scans for vulnerabilities, infrastructure misconfigurations and secrets.)*
-2. ArgoCD detects the PRs labeled `preview-ready` and deploys the application into a dedicated namespace, `pr-<number>`. Every new commit is rebuilt and redeployed into the same namespace.
-3. A health check verifies that the environment responds, then the URL is posted on the PR: `http://pr-42.127-0-0-1.nip.io`.
-4. Datadog monitors the memory, CPU and logs of each environment.
-5. When the PR is closed, the environment is **deleted automatically**.
-
-## Architecture
+## How it works
 
 ```mermaid
 flowchart LR
-    PR[Pull request<br/>on MicroPizzeria] --> CI[GitHub Actions<br/>build 3 images]
-    CI --> GHCR[(GHCR<br/>images pr-42-abc12345)]
+    PR[Pull request<br/>on MicroPizzeria] --> CI[GitHub Actions<br/>builds 3 images]
+    CI --> GHCR[(GHCR<br/>tag pr-n-sha8)]
     CI -->|label preview-ready| PR
 
     subgraph Laptop["Laptop: kind cluster, created by Terraform"]
-        Argo[ArgoCD<br/>ApplicationSet] -->|creates| NS[namespace pr-42<br/>MicroPizzeria + NetworkPolicy + quotas]
+        Argo[Argo CD ApplicationSet<br/>Pull Request generator] -->|creates| NS[namespace pr-n<br/>MicroPizzeria]
         Traefik[Traefik] --> NS
-        DD[Datadog agent] -.monitors.-> NS
     end
 
-    Argo -->|reads PRs| PR
-    NS -->|pulls image| GHCR
-    Argo -->|status + URL| PR
+    Argo -->|polls open PRs| PR
+    NS -->|pulls images| GHCR
+    User([Browser]) -->|http://pr-n.127-0-0-1.nip.io| Traefik
 ```
 
-**Every connection is outbound from the laptop; nothing comes in.** ArgoCD polls GitHub and the cluster pulls images. Nothing is exposed to the Internet, and port 80 only listens on `127.0.0.1`.
+1. A pull request on [MicroPizzeria](https://github.com/sana-Benz/MicroPizzeria) triggers GitHub Actions, which builds its three images (`frontend`, `user-service`, `order-service`) from the PR's head commit and pushes them to GHCR as `pr-<number>-<first 8 chars of the SHA>`. Once all three builds succeed, the PR gets the `preview-ready` label.
+2. An Argo CD ApplicationSet (Pull Request generator) lists the open PRs with that label and creates one Application per PR, deployed into its own namespace `pr-<number>`.
+3. Traefik routes `http://pr-<number>.127-0-0-1.nip.io` to that namespace.
+4. A new commit is rebuilt and rolled out in the same namespace; closing the PR deletes the Application, its namespace and its data.
 
-### The tag contract
+**Key design choice:** GitHub Actions and Argo CD never talk to each other. Both derive the same image tag from the PR number and the commit SHA, so the image Argo CD deploys is exactly the one CI built from that commit.
 
-GitHub Actions and ArgoCD never talk to each other. Both compute the same image name from the same two facts, the PR number and its head commit:
+**Stack:** kind, Terraform, Traefik, Argo CD, GitHub Actions, GHCR, Kustomize.
 
-```
-PR #42, head commit abc12345ef…
-  GitHub Actions builds and pushes  ghcr.io/sana-benz/micropizzeria-frontend:pr-42-abc12345
-  ArgoCD deploys                    ghcr.io/sana-benz/micropizzeria-frontend:pr-42-abc12345
-```
+## MVP
 
-Each build also moves a `pr-42` tag to the latest build of the PR, for humans; deployments never use it. Images stay in GHCR after the PR is closed (cleanup is a planned extension).
+The MVP covers the full lifecycle of a preview, with no manual command: **one pull request = one isolated environment**, created automatically, updated in place on every new commit, and deleted when the pull request is closed.
 
-### Known limitations (MVP)
+**Tested end to end** on MicroPizzeria PR #5: the preview was created automatically and reached *Synced / Healthy*; a second commit was rolled out in place (new pods ready before the old ones stopped, same namespace, database content kept); closing the PR deleted the Application, the namespace and its volumes in about a minute. Measured: CI ≈ 45 s per commit, cleanup ≈ 1 min after closing.
 
-The `preview-ready` label is added once, after the first successful build, so it only protects the **first** deployment. For later commits, Kubernetes rolling updates keep the previous version online:
+**Tag:** [`v0.1-mvp`](https://github.com/sana-Benz/PRVue/releases/tag/v0.1-mvp)
 
-- **A new commit can show `ImagePullBackOff` for a few minutes.** ArgoCD may see the commit before CI has published its images. The old pod keeps serving until the new image exists; Kubernetes retries with an increasing delay (up to about 5 minutes between attempts), so the switch can lag behind CI.
-- **A failed build on a later commit** leaves the previous version running and shows the Application as *Degraded* in ArgoCD.
-- **Pull requests from forks** get no preview: their `GITHUB_TOKEN` is read-only, so their images cannot be published.
-- **Preview secrets are demo-only values.** The MySQL passwords and the JWT key of each preview are throwaway values committed in MicroPizzeria's `kustomization.yaml` (`secretGenerator`, value `preview-only-not-a-secret`). They protect nothing real: each preview has its own test databases, deleted with the PR. Real secrets must never be handled this way; they would need a dedicated mechanism such as Sealed Secrets, External Secrets or Doppler (planned extension).
-- **No webhooks, so updates are not instant.** The cluster only listens on `127.0.0.1`, so GitHub can't notify it; ArgoCD polls GitHub every 120 s (with a GitHub token: anonymous access is limited to 60 requests/hour). Expected delay between a push and the updated preview: CI build time + up to 120 s of polling + possibly the image-pull retry delay (up to about 5 minutes).
+**Known limitations**
+- **Demo-only secrets:** each preview's database passwords are throwaway values committed in MicroPizzeria (`preview-only-not-a-secret`). Real secrets would need a dedicated mechanism (Sealed Secrets, External Secrets…).
+- **About 2 minutes of polling delay:** the cluster accepts no incoming connections, so there is no webhook; Argo CD checks GitHub every 120 s.
+- **Local only:** everything runs on a kind cluster on one laptop.
+- **No previews for PRs from forks:** their GitHub token is read-only, so CI can't publish their images.
+- Each PR gets its own namespace, but **two automatic previews running at the same time have not been tested yet**.
 
-### Two repositories, two roles
+### Why MicroPizzeria as the demo application
 
-| Repository | Content | Role |
-| --- | --- | --- |
-| [MicroPizzeria](https://github.com/sana-Benz/MicroPizzeria) | The application: Nginx frontend, Flask `user-service` and `order-service`, two MySQL databases | PRs opened here trigger the previews |
-| **PRVue** (this repo) | The platform: Terraform, ArgoCD | Builds the foundation and creates one environment per PR |
+Instead of writing a toy app, I reused one of my own earlier projects, [MicroPizzeria](https://github.com/sana-Benz/MicroPizzeria):
+- a realistic microservices app (an Nginx frontend, two Flask services, two MySQL databases);
+- it already had Dockerfiles and Kubernetes manifests, so PRVue could focus on the platform rather than the app;
+- its original standalone Minikube version is preserved under the tag `v1-minikube`; it was then adapted for PRVue (Kustomize, dynamic namespaces, Traefik routing, a CI workflow) without changing its application architecture.
 
-This split mirrors how companies work: a platform team provides the tooling, and application teams use it.
+## Design choices
 
-## Tech stack
+| Choice | Why |
+| --- | --- |
+| **Two repositories** | MicroPizzeria holds the app, its manifests and its CI; PRVue holds the platform (Terraform, Argo CD). This mirrors a platform team providing tooling to application teams. |
+| **Pull model (Argo CD polls GitHub)** | Every connection is outbound from the laptop: Argo CD reads GitHub and the cluster pulls images. Nothing is exposed to the Internet; port 80 only listens on `127.0.0.1`. |
+| **The namespace as the only input** | Argo CD only sets the namespace (`pr-<n>`) and the image tags. Kustomize derives the rest from the namespace, including the hostname. |
+| **A dedicated Argo CD project** | The `previews` AppProject only allows `pr-*` namespaces and the resource kinds MicroPizzeria uses, so a preview can never be deployed into `default` or a shared namespace (tested: such syncs are refused). |
+| **Immutable image tags** | `pr-<n>-<sha8>` is built once per commit and never overwritten, so it is always clear which commit is running. A moving `pr-<n>` tag points to the latest build, for humans only. |
+| **Traefik** | Lightweight, maintained ingress controller (ingress-nginx was retired). Each preview is routed by hostname. |
+| **nip.io with a dashed IP** | `pr-12.127-0-0-1.nip.io` resolves to `127.0.0.1` with no DNS setup. The dotted form `pr-12.127.0.0.1.nip.io` is misread by nip.io as `12.127.0.0`. |
+| **kind + Terraform** | A free local cluster, created and destroyed with one command. |
 
-| Tool | Role in PRVue | Why this choice |
-| --- | --- | --- |
-| **kind** | Local Kubernetes cluster (nodes are Docker containers) | Free, lightweight, manageable with Terraform |
-| **Terraform** | Creates and destroys the foundation with a single command | Infrastructure as Code: an identical, reproducible foundation |
-| **Helm** | Installs Traefik and ArgoCD (through Terraform) | Ready-made packages with pinned versions |
-| **Traefik** | Ingress controller: routes each URL to the right environment | Lightweight and maintained; the ingress-nginx project was retired by Kubernetes in 2026 |
-| **ArgoCD** | GitOps: creates and deletes one environment per PR (*Pull Request* generator) | *Pull* model: the cluster fetches the desired state from Git, no inbound access needed |
-| **GitHub Actions** | CI: build, scans, image publishing | Built into GitHub, free for public repositories |
-| **Trivy / Checkov / Gitleaks** | Blocking scans: images, IaC, secrets | Security built into the pipeline (*shift left*) |
-| **Datadog** | Per-environment metrics, logs and alerts | Student offer, observability filterable by namespace |
+## 🚧 Coming soon
 
-## Security
+The MVP covers the core lifecycle. These features are next on the roadmap:
 
-✅ = in place, ⏳ = planned.
-
-- ✅ **Network**: the cluster only listens on `127.0.0.1`, so it cannot be reached from the local network.
-- ✅ **Secrets**: never stored in the repository. The Terraform state, `*.tfvars` files and the kubeconfig are excluded by `.gitignore`. Secrets will be passed to Terraform through environment variables (`TF_VAR_...`).
-- ✅ **Protected `main` branch** on MicroPizzeria: no force push, no deletion, changes must go through a PR.
-- ⏳ **Isolation**: each environment will get its own namespace, *deny-by-default* NetworkPolicies (one environment cannot reach another) and resource quotas.
-- ⏳ **Defense in depth against secret leaks**: `.gitignore`, a local Gitleaks pre-commit hook, then Gitleaks in CI.
-- ⏳ **Pipeline**: images scanned by Trivy (blocking on `CRITICAL`/`HIGH`), IaC scanned by Checkov, third-party actions pinned to a commit SHA.
-
-## Project status
-
-> 🏷️ **[`v0.1-mvp`](https://github.com/sana-Benz/PRVue/releases/tag/v0.1-mvp)**: MVP, automated PR preview lifecycle with GitHub Actions, GHCR and Argo CD (steps 1 to 4). Tested end to end on MicroPizzeria PR #5: preview created, updated in place, deleted when the PR was closed.
-
-| Step | Content | Status |
-| --- | --- | --- |
-| 1 | Local foundation: kind cluster, Traefik and ArgoCD with Terraform | ✅ |
-| 2 | MicroPizzeria Kustomize manifests (✅), NetworkPolicies and quotas (⏳ after the MVP) | 🟡 |
-| 3 | CI: build the 3 images, publish to GHCR, add `preview-ready` (✅ first run on PR #4); Trivy, Checkov, Gitleaks after the MVP | 🟡 |
-| 4 | One environment per PR with an ArgoCD ApplicationSet: create, update in place and delete tested on PR #5 | ✅ |
-| 5 | Post-deployment health check and PR feedback (status + URL) | ⏳ |
-| 6 | Datadog observability: per-environment dashboard and alerts | ⏳ |
-| 7 | Measurements, architecture decision records (ADRs), runbook, demo video | ⏳ |
-
-**Planned extensions**: secrets with Doppler, cleanup of idle environments, AWS Terraform on LocalStack, Azure AKS demo, LLM review of the Terraform plan.
+- Health checks after each deployment, with the preview URL posted on the pull request
+- Monitoring of each preview environment
+- Automatic cleanup of the images of closed pull requests
+- Security scanning in CI (images, infrastructure code, secrets)
+- Better secrets management for previews
 
 ## Getting started
 
-What works today: the local foundation.
-
-**Prerequisites**: Docker, kind, kubectl, Terraform, Helm.
+**Prerequisites:** Docker, kind, kubectl, Terraform, Helm, and the MicroPizzeria repository with its preview workflow and a `preview-ready` label.
 
 ```bash
-cd platform/terraform
-terraform init
-terraform apply          # creates the "previews" kind cluster, then installs Traefik and ArgoCD
+# 1. Foundation: kind cluster, Traefik and Argo CD
+cd platform/terraform && terraform init && terraform apply && cd ../..
+curl http://localhost        # "404 page not found": Traefik answers, nothing deployed yet
 
-kubectl get pods -A      # every pod should be Running
-curl http://localhost    # "404 page not found": Traefik answers, no application is deployed yet
+# 2. GitHub token for the Pull Request generator
+#    (fine-grained, MicroPizzeria only, Pull requests + Metadata read-only; never commit it)
+read -s GITHUB_TOKEN
+kubectl create secret generic github-token -n argocd --from-literal=token="$GITHUB_TOKEN"
+unset GITHUB_TOKEN
 
-terraform destroy        # removes everything
+# 3. Previews
+kubectl apply -f platform/argocd/appproject.yaml
+kubectl apply -f platform/argocd/applicationset.yaml
+
+# Then open a pull request on MicroPizzeria and watch:
+kubectl get applications -n argocd -w
 ```
+
+`terraform destroy` removes everything. Deleting the ApplicationSet deletes **all** preview environments.
 
 ## Repository layout
 
@@ -146,28 +114,11 @@ terraform destroy        # removes everything
 │   │   ├── appproject.yaml     # "previews" project: pr-* namespaces and MicroPizzeria kinds only
 │   │   └── applicationset.yaml # one Application per PR labeled preview-ready
 │   └── terraform/
-│       ├── providers.tf    # kind and helm providers
-│       ├── cluster.tf      # "previews" kind cluster, port 80 → 30080
-│       ├── platform.tf     # Traefik and ArgoCD (Helm charts, pinned versions)
-│       └── values/         # chart settings
-├── GUIDE.md                # detailed project roadmap (French)
-├── AVANCEMENT.md           # progress log: what was done, and why (French)
-├── PROBLEMS.md             # problems, debugging, decisions and concepts
+│       ├── providers.tf        # kind and helm providers
+│       ├── cluster.tf          # "previews" kind cluster, port 80 → 30080 on 127.0.0.1
+│       ├── platform.tf         # Traefik and Argo CD (Helm charts, pinned versions)
+│       └── values/             # chart settings
 └── demo/
-    ├── DEMO_SCRIPT.md      # demo steps, fallbacks and reset procedure
-    └── prepare.sh          # read-only readiness check before a demo
+    ├── DEMO_SCRIPT.md          # demo steps, fallbacks and reset procedure
+    └── prepare.sh              # read-only readiness check before a demo
 ```
-
-Coming next: `docs/adr/` (decision records) and `docs/runbook.md`.
-
-## Measurements
-
-To be collected in step 7:
-
-| Measurement | Value |
-| --- | --- |
-| Foundation creation time (`terraform apply` from scratch) | TBD |
-| Time from PR opened to environment ready | TBD (CI alone: ≈ 45 s per commit, 3 runs; ArgoCD polling adds up to 120 s) |
-| Teardown time after the PR is closed | ≈ 1 min (PR #5: Application, namespace and volumes deleted 58–67 s after `gh pr close`) |
-| RAM per environment | TBD |
-| Cost | **€0** |
