@@ -10,3 +10,6 @@
 
 # Kubeconfig généré par le provider kind : clé d'accès au cluster
 *-config
+AVANCEMENT.md
+GUIDE.md
+PROBLEMS.md
