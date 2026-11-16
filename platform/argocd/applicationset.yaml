@@ -1,0 +1,52 @@
+# One Argo CD Application per open MicroPizzeria pull request labeled "preview-ready".
+# PR closed → the PR disappears from the generator → Application deleted → its resources and namespace deleted.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: micropizzeria-previews
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]   # fails on an unknown template variable (typo), not on a forgotten field
+
+  generators:
+    - pullRequest:
+        github:
+          owner: sana-Benz
+          repo: MicroPizzeria
+          tokenRef:                          # read-only fine-grained token, created by hand (never in Git)
+            secretName: github-token
+            key: token
+          labels:
+            - preview-ready                  # added by the MicroPizzeria CI once the 3 images are published
+        requeueAfterSeconds: 120             # polling interval (default: 30 minutes); no webhook can reach the laptop
+
+  template:
+    metadata:
+      name: "micropizzeria-pr-{{.number}}"
+      finalizers:
+        # deleting the Application deletes its resources (also added by the controller itself, per the docs)
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: previews                      # the fence: pr-* namespaces only, never "default"
+      source:
+        repoURL: https://github.com/sana-Benz/MicroPizzeria.git
+        targetRevision: "{{.head_sha}}"      # manifests from the same commit as the images
+        path: .                              # kustomization.yaml at the root of MicroPizzeria
+        kustomize:
+          # the only input of the manifests: also renames the Namespace object and derives
+          # the Ingress host (pr-<n>.127-0-0-1.nip.io) and the Traefik middleware reference
+          namespace: "pr-{{.number}}"
+          # tag contract with the CI: pr-<number>-<first 8 chars of the head SHA>
+          images:
+            - "sanabns/frontend=ghcr.io/sana-benz/micropizzeria-frontend:pr-{{.number}}-{{.head_short_sha}}"
+            - "sanabns/user-service=ghcr.io/sana-benz/micropizzeria-user-service:pr-{{.number}}-{{.head_short_sha}}"
+            - "sanabns/order-service=ghcr.io/sana-benz/micropizzeria-order-service:pr-{{.number}}-{{.head_short_sha}}"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "pr-{{.number}}"
+      syncPolicy:
+        automated:
+          prune: true       # a resource removed from Git is removed from the cluster
+          selfHeal: true    # a manual change in the cluster is reverted to what Git says
+        # no CreateNamespace=true: the Namespace is part of the manifests, so Argo CD owns it and deletes it
