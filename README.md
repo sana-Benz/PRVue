@@ -62,6 +62,7 @@ The `preview-ready` label is added once, after the first successful build, so it
 - **A new commit can show `ImagePullBackOff` for a few minutes.** ArgoCD may see the commit before CI has published its images. The old pod keeps serving until the new image exists; Kubernetes retries with an increasing delay (up to about 5 minutes between attempts), so the switch can lag behind CI.
 - **A failed build on a later commit** leaves the previous version running and shows the Application as *Degraded* in ArgoCD.
 - **Pull requests from forks** get no preview: their `GITHUB_TOKEN` is read-only, so their images cannot be published.
+- **Preview secrets are demo-only values.** The MySQL passwords and the JWT key of each preview are throwaway values committed in MicroPizzeria's `kustomization.yaml` (`secretGenerator`, value `preview-only-not-a-secret`). They protect nothing real: each preview has its own test databases, deleted with the PR. Real secrets must never be handled this way; they would need a dedicated mechanism such as Sealed Secrets, External Secrets or Doppler (planned extension).
 - **No webhooks, so updates are not instant.** The cluster only listens on `127.0.0.1`, so GitHub can't notify it; ArgoCD polls GitHub every 120 s (with a GitHub token: anonymous access is limited to 60 requests/hour). Expected delay between a push and the updated preview: CI build time + up to 120 s of polling + possibly the image-pull retry delay (up to about 5 minutes).
 
 ### Two repositories, two roles
@@ -99,12 +100,14 @@ This split mirrors how companies work: a platform team provides the tooling, and
 
 ## Project status
 
+> 🏷️ **[`v0.1-mvp`](https://github.com/sana-Benz/PRVue/releases/tag/v0.1-mvp)**: MVP, automated PR preview lifecycle with GitHub Actions, GHCR and Argo CD (steps 1 to 4). Tested end to end on MicroPizzeria PR #5: preview created, updated in place, deleted when the PR was closed.
+
 | Step | Content | Status |
 | --- | --- | --- |
 | 1 | Local foundation: kind cluster, Traefik and ArgoCD with Terraform | ✅ |
 | 2 | MicroPizzeria Kustomize manifests (✅), NetworkPolicies and quotas (⏳ after the MVP) | 🟡 |
 | 3 | CI: build the 3 images, publish to GHCR, add `preview-ready` (✅ first run on PR #4); Trivy, Checkov, Gitleaks after the MVP | 🟡 |
-| 4 | One environment per PR with an ArgoCD ApplicationSet | ⏳ |
+| 4 | One environment per PR with an ArgoCD ApplicationSet: create, update in place and delete tested on PR #5 | ✅ |
 | 5 | Post-deployment health check and PR feedback (status + URL) | ⏳ |
 | 6 | Datadog observability: per-environment dashboard and alerts | ⏳ |
 | 7 | Measurements, architecture decision records (ADRs), runbook, demo video | ⏳ |
@@ -133,6 +136,9 @@ terraform destroy        # removes everything
 ```
 .
 ├── platform/
+│   ├── argocd/
+│   │   ├── appproject.yaml     # "previews" project: pr-* namespaces and MicroPizzeria kinds only
+│   │   └── applicationset.yaml # one Application per PR labeled preview-ready
 │   └── terraform/
 │       ├── providers.tf    # kind and helm providers
 │       ├── cluster.tf      # "previews" kind cluster, port 80 → 30080
@@ -140,10 +146,13 @@ terraform destroy        # removes everything
 │       └── values/         # chart settings
 ├── GUIDE.md                # detailed project roadmap (French)
 ├── AVANCEMENT.md           # progress log: what was done, and why (French)
-└── PROBLEMS.md             # problems, debugging, decisions and concepts
+├── PROBLEMS.md             # problems, debugging, decisions and concepts
+└── demo/
+    ├── DEMO_SCRIPT.md      # demo steps, fallbacks and reset procedure
+    └── prepare.sh          # read-only readiness check before a demo
 ```
 
-Coming next: `platform/argocd/applicationset.yaml`, `.github/workflows/`, `docs/adr/` (decision records) and `docs/runbook.md`.
+Coming next: `docs/adr/` (decision records) and `docs/runbook.md`.
 
 ## Measurements
 
@@ -152,7 +161,7 @@ To be collected in step 7:
 | Measurement | Value |
 | --- | --- |
 | Foundation creation time (`terraform apply` from scratch) | TBD |
-| Time from PR opened to environment ready | TBD |
-| Teardown time after the PR is closed | TBD |
+| Time from PR opened to environment ready | TBD (CI alone: ≈ 45 s per commit, 3 runs; ArgoCD polling adds up to 120 s) |
+| Teardown time after the PR is closed | ≈ 1 min (PR #5: Application, namespace and volumes deleted 58–67 s after `gh pr close`) |
 | RAM per environment | TBD |
 | Cost | **€0** |

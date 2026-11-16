@@ -76,7 +76,7 @@ Ajoute dès le début un `.gitignore` contenant au minimum `*.tfstate*`, `.terra
 ## Étape 0 — Préparer les comptes
 
 1. **Datadog** : active l'offre du Student Pack sur la page du programme étudiant Datadog. Récupère une clé d'API et note le site de ton compte (`datadoghq.com`, `datadoghq.eu`…).
-2. **Jeton GitHub pour ArgoCD** : crée un jeton *fine-grained* limité à ton dépôt, en lecture seule sur *Pull requests* et *Metadata*. Sans lui, l'API GitHub bloque vite les requêtes d'ArgoCD.
+2. **Jeton GitHub pour ArgoCD** : voir [Étape 4 › Jeton GitHub](#jeton-github-pour-le-générateur-de-pr) (création, stockage dans le cluster, renouvellement).
 3. **Label `preview-ready`** : crée-le **une fois** dans MicroPizzeria. Tu ne le poses jamais à la main : c'est la CI qui l'ajoute, après le premier build réussi des trois images. ArgoCD ne déploie que les PR qui le portent.
    ```bash
    gh label create preview-ready -R sana-Benz/MicroPizzeria --color 0E8A16 \
@@ -493,28 +493,45 @@ Objectif : une PR dont les images sont construites (label `preview-ready`) obtie
 
 **Pas de webhook** : le cluster n'écoute que sur `127.0.0.1`, GitHub ne peut pas le prévenir. Délai attendu entre un push et la mise à jour de la preview = durée de la CI + jusqu'à 120 s (passage du générateur) + éventuellement le délai de réessai du pull d'image (jusqu'à environ 5 minutes si ArgoCD a vu le commit avant la fin de la CI).
 
-Crée d'abord le secret du jeton GitHub, via Terraform avec `TF_VAR_github_token` :
+### Jeton GitHub pour le générateur de PR
 
-```hcl
-# platform/terraform/secrets.tf
-variable "github_token" {
-  type      = string
-  sensitive = true
-}
+**Créer le jeton** : GitHub → *Settings* → *Developer settings* → *Personal access tokens* → **Fine-grained tokens** → *Generate new token* :
 
-resource "kubernetes_secret" "github_token" {
-  metadata {
-    name      = "github-token"
-    namespace = "argocd"
-  }
-  data = {
-    token = var.github_token
-  }
-  depends_on = [helm_release.argocd]
-}
+| Réglage | Valeur |
+| --- | --- |
+| Repository access | *Only select repositories* → `MicroPizzeria` |
+| Permissions | **Pull requests : Read-only**, **Metadata : Read-only** (rien d'autre) |
+| Expiration | 90 jours (note la date) |
+
+**Le stocker dans le cluster**, sans qu'il apparaisse à l'écran, dans l'historique du shell ou dans Git :
+```bash
+read -s GITHUB_TOKEN        # colle le jeton, puis Entrée (rien ne s'affiche)
+kubectl create secret generic github-token -n argocd --from-literal=token="$GITHUB_TOKEN"
+unset GITHUB_TOKEN
+kubectl label secret github-token -n argocd argocd.argoproj.io/secret-type=scm-creds
+kubectl get secret github-token -n argocd   # vérifier : TYPE Opaque, DATA 1 (jamais afficher la valeur)
 ```
 
-Le secret apparaît en clair dans le fichier d'état Terraform : garde ce fichier local et ignoré par Git. L'extension Doppler règlera ce point.
+- **Pourquoi pas Terraform** : une ressource `kubernetes_secret` écrirait le jeton en clair dans `terraform.tfstate`. Avec `kubectl`, il n'existe que dans le cluster.
+- **Le label `scm-creds`** n'est pas obligatoire aujourd'hui : le « strict mode » de l'ApplicationSet controller est désactivé par défaut (code source v3.5.3 : `--token-ref-strict-mode`, défaut `false`). Activé, il refuse tout Secret sans ce label. On le pose pour que ça continue de marcher si on l'active.
+- **Pourquoi un jeton** : sans lui, l'API GitHub limite à 60 requêtes par heure (anonyme). Avec : 5 000.
+
+**Renouveler avant l'expiration** (crée le nouveau jeton d'abord, l'ancien reste valable jusque-là) :
+```bash
+read -s GITHUB_TOKEN
+kubectl create secret generic github-token -n argocd --from-literal=token="$GITHUB_TOKEN" \
+  --dry-run=client -o yaml | kubectl apply -f -      # remplace la valeur, garde le nom
+unset GITHUB_TOKEN
+kubectl label secret github-token -n argocd argocd.argoproj.io/secret-type=scm-creds --overwrite
+kubectl logs -n argocd deploy/argocd-applicationset-controller --since=5m | grep -iE "error|401|403"   # rien = OK
+```
+Le contrôleur relit le Secret à chaque passage (code source : `GetSecretRef` à chaque génération), donc pas besoin de redémarrage. Supprime ensuite l'ancien jeton sur GitHub.
+
+Si le jeton expire : le générateur échoue (erreurs 401 dans les logs). **Hypothèse non vérifiée** : les previews existantes restent en place, mais aucune nouvelle PR n'est détectée.
+
+### AppProject et ApplicationSet
+
+Les manifests réels sont dans `platform/argocd/` : `appproject.yaml` (la clôture) et `applicationset.yaml` (une Application par PR). L'exemple ci-dessous montre la structure ; les fichiers font foi.
 
 ```yaml
 # platform/argocd/applicationset.yaml
@@ -529,8 +546,8 @@ spec:
   generators:
     - pullRequest:
         github:
-          owner: <ton-compte>
-          repo: <ton-depot>
+          owner: sana-Benz
+          repo: MicroPizzeria
           tokenRef:
             secretName: github-token
             key: token
@@ -539,11 +556,11 @@ spec:
         requeueAfterSeconds: 120     # défaut : 30 minutes
   template:
     metadata:
-      name: "pr-{{.number}}"
+      name: "micropizzeria-pr-{{.number}}"
     spec:
       project: previews      # AppProject limité à pr-* (voir plus haut), jamais "default"
       source:
-        repoURL: https://github.com/<ton-compte>/<ton-depot>.git
+        repoURL: https://github.com/sana-Benz/MicroPizzeria.git
         targetRevision: "{{.head_sha}}"   # manifests du même commit que les images
         path: .                           # kustomization.yaml à la racine de MicroPizzeria
         kustomize:
@@ -559,15 +576,35 @@ spec:
         automated:
           prune: true
           selfHeal: true
-        syncOptions:
-          - CreateNamespace=true
+        # pas de CreateNamespace=true : le Namespace fait partie des manifests, ArgoCD le possède et le supprime
 ```
 
-Applique-le, puis teste :
+**Santé de l'Ingress** : ArgoCD ne déclare un Ingress *Healthy* que si son `status.loadBalancer.ingress` contient une adresse (code source v3.5.3, `getIngressHealth` : sinon *Progressing*, pour toujours). Traefik copie par défaut le statut de son Service, et un Service `NodePort` n'en a pas. D'où, dans `values/traefik.yaml` :
+```yaml
+providers:
+  kubernetesIngress:
+    publishedService:
+      enabled: false
+    ingressEndpoint:
+      ip: "127.0.0.1"     # l'adresse réelle des previews
+```
 
+**Appliquer** (dans cet ordre) :
 ```bash
+cd platform/terraform && terraform apply && cd ../..        # Traefik : statut des Ingress
+kubectl get ingress -A                                      # ADDRESS = 127.0.0.1
+kubectl apply -f platform/argocd/appproject.yaml
 kubectl apply -f platform/argocd/applicationset.yaml
-gh pr create --title "test preview" --body "test"     # la CI posera preview-ready
+kubectl logs -n argocd deploy/argocd-applicationset-controller --since=5m | grep -iE "error|level=warn"
+kubectl get applicationset -n argocd micropizzeria-previews \
+  -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.message}{"\n"}{end}'   # ParametersGenerated=True
+```
+
+> ⚠️ **Supprimer l'ApplicationSet supprime TOUTES les previews.** Ses Applications sont supprimées avec lui, et le finalizer de chacune supprime son namespace, ses bases et ses volumes. C'est voulu, mais pour modifier l'ApplicationSet, utilise `kubectl apply` (mise à jour en place), jamais `kubectl delete` puis `apply`.
+
+**Tester** (la PR doit venir de la branche du dépôt, pas d'un fork) :
+```bash
+gh pr create -R sana-Benz/MicroPizzeria --title "test preview" --body "test"     # la CI posera preview-ready
 kubectl get applications -n argocd -w
 ```
 
@@ -722,6 +759,22 @@ Relève tes vrais chiffres et remplace ce guide par le README final.
 - Arrête le cluster en fin de session avec `terraform destroy`, et recrée-le avec `terraform apply`.
 - Ferme les applications lourdes pendant les sessions de travail.
 - Pour les sessions lourdes, travaille dans GitHub Codespaces, inclus dans le Student Pack, dans la limite de son quota mensuel.
+
+---
+
+## Avant une démo : partir de zéro preview
+
+La démo doit commencer avec **aucun** namespace `pr-*`. Un namespace `pr-*` qui n'appartient à aucune Application ArgoCD est un reste de test manuel (comme `pr-2`, créé à la main en phase 3) : ArgoCD ne le supprimera jamais.
+
+`./demo/prepare.sh` (lecture seule) signale ces restes ; procédure complète dans `demo/DEMO_SCRIPT.md`, section Reset. À la main :
+```bash
+kubectl get ns -o name | grep '^namespace/pr-'                      # tous les pr-*
+kubectl get applications -n argocd \
+  -o jsonpath='{range .items[*]}{.spec.destination.namespace}{"\n"}{end}'   # ceux gérés par ArgoCD
+# un pr-* de la première liste absent de la seconde = reste manuel :
+kubectl delete namespace pr-2                                         # supprime tout, volumes compris
+```
+Pour une preview gérée par ArgoCD, ne supprime pas le namespace à la main : ferme la PR (selfHeal le recréerait tant que la PR est ouverte).
 
 ---
 

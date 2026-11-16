@@ -273,6 +273,49 @@ gh label create preview-ready -R sana-Benz/MicroPizzeria --color 0E8A16 \
 ```
 Après le premier push : passer les 3 packages GHCR en public (GUIDE, étape 3).
 
+**Résultat du premier run (PR #4)** : les 4 jobs verts ; 3 images × 2 tags (`pr-4`, `pr-4-5b6f929c`) ; label `preview-ready` posé ; packages **déjà publics** sans action manuelle, et liés au dépôt (barre latérale *Packages*). Détails : PROBLEMS.md, D10 et D12.
+
+### 11. Phase 4b : AppProject et ApplicationSet (écrits, vérifiés à blanc, pas encore appliqués)
+
+Fichiers dans PRVue : `platform/argocd/appproject.yaml`, `platform/argocd/applicationset.yaml`, et `platform/terraform/values/traefik.yaml` (modifié).
+
+**Vérifié avant d'appliquer :**
+- Jeton : Secret `github-token` présent (`kubectl get secret`, sans afficher la valeur). Le label `scm-creds` n'est exigé qu'en « strict mode », désactivé par défaut (code source v3.5.3) : on le pose quand même.
+- Doc et code source v3.5 : `head_short_sha` = 8 caractères ; le générateur ne liste que les PR ouvertes ; le finalizer est ajouté par le contrôleur ; `clusterResourceWhitelist` accepte un `name`.
+- **Rendu à blanc** avec le kustomize d'ArgoCD, à partir de Git (`git archive 5b6f929c`), pour une fausse PR 99 : namespace `pr-99` partout, 3 images `pr-99-5b6f929c`, host `pr-99.127-0-0-1.nip.io`, 7 références de secrets toutes satisfaites.
+- Le nœud kind tire l'image publique de GHCR sans identifiants.
+- `kubectl apply --dry-run=server` accepte les deux manifests ; `terraform plan` : 0 ajout, 1 modification (Traefik), 0 suppression.
+
+**Problème trouvé avant d'appliquer (P7)** : ArgoCD ne déclare un Ingress *Healthy* que s'il a une adresse dans son statut, et Traefik n'en écrit pas (Service `NodePort`). Les previews seraient restées *Progressing* pour toujours. Correction proposée : Traefik écrit `127.0.0.1` dans le statut des Ingress.
+
+**Tableau de parité** avec le déploiement manuel de la phase 3 : PROBLEMS.md, D16.
+
+**Appliqué le 2026-11-16 (étapes 1 et 2 du plan de test) :**
+- Traefik : `terraform apply` d'un plan enregistré (1 modification). Les Ingress ont maintenant `ADDRESS 127.0.0.1` ; pr-2 répond toujours 200.
+- AppProject `previews` appliqué. **Test de clôture** : une Application qui rendait dans `micropizzeria` et une autre qui visait `default` ont toutes les deux été **refusées**, sans rien créer (PROBLEMS.md, D15).
+- ApplicationSet appliqué : `ParametersGenerated=True`, `generated 0 applications` (aucune PR ouverte avec le label), relance toutes les 2 min, aucune erreur.
+
+**Étapes 3 et 4 réussies : première preview automatique (PR #5).** CI verte → label → `micropizzeria-pr-5` *Synced/Healthy* sans aucune commande manuelle. Images `pr-5-f7f4bde7` (= 8 premiers caractères du commit de tête), 5 pods `Running`, 2 PVC `Bound`, Ingress avec `ADDRESS 127.0.0.1`, finalizer présent sur l'Application générée, namespace possédé par ArgoCD. L'application répond via Traefik, et le compte et la commande créés dans le navigateur sont dans les bases de `pr-5`. Détails : PROBLEMS.md, D16.
+
+**Étape 5 réussie : deuxième commit sur la PR #5** (`0c90bebf`, CI en 43 s). Mise à jour progressive : chaque nouveau pod applicatif est passé 1/1 avant l'arrêt de l'ancien, les pods MySQL n'ont pas bougé. Même namespace (même date de création), mêmes volumes, même utilisateur, même commande.
+
+**Étape 6 réussie : PR #5 fermée sans fusion.** Environ 1 min après : Application supprimée, namespace `pr-5` introuvable, 0 volume restant. pr-2 intact (mêmes UID), et les 9 tags d'images de pr-5 toujours lisibles sur GHCR.
+
+**Le cycle de vie complet fonctionne sans aucune commande manuelle** : ouverture → preview → mise à jour sur place → fermeture → nettoyage.
+
+**Mesures** : CI ≈ 45 s par commit ; nettoyage ≈ 1 min après la fermeture.
+
+**Reste à montrer** : deux previews automatiques en même temps (pendant la démo).
+
+**À faire :**
+- ~~Label `scm-creds` sur le Secret `github-token`~~ : posé (vérifié par `demo/prepare.sh`).
+- ~~`pr-2` (reste manuel de la phase 3)~~ : supprimé ; `demo/prepare.sh` passe 14/14.
+- Tag `v0.1-mvp` : MVP, cycle de vie automatique des previews (étapes 1 à 4).
+
+**Après l'enregistrement de la démo :**
+- Reset, puis `demo/prepare.sh` à 14/14.
+- Correction du README de MicroPizzeria (la ligne « pas encore exécuté ») : la PR #5 a été fermée sans fusion pour le test. Ouvrir une **nouvelle PR** avec cette correction, puis la **fusionner**. Pas avant l'enregistrement : une PR ouverte avec le label ferait échouer la préparation.
+
 ---
 
 ## Concepts compris
