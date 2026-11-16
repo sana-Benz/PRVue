@@ -77,7 +77,12 @@ Ajoute dès le début un `.gitignore` contenant au minimum `*.tfstate*`, `.terra
 
 1. **Datadog** : active l'offre du Student Pack sur la page du programme étudiant Datadog. Récupère une clé d'API et note le site de ton compte (`datadoghq.com`, `datadoghq.eu`…).
 2. **Jeton GitHub pour ArgoCD** : crée un jeton *fine-grained* limité à ton dépôt, en lecture seule sur *Pull requests* et *Metadata*. Sans lui, l'API GitHub bloque vite les requêtes d'ArgoCD.
-3. **Label `preview`** : crée ce label dans ton dépôt. Seules les PR qui le portent recevront un environnement, ce qui protège ta RAM.
+3. **Label `preview-ready`** : crée-le **une fois** dans MicroPizzeria. Tu ne le poses jamais à la main : c'est la CI qui l'ajoute, après le premier build réussi des trois images. ArgoCD ne déploie que les PR qui le portent.
+   ```bash
+   gh label create preview-ready -R sana-Benz/MicroPizzeria --color 0E8A16 \
+     --description "Images built: PRVue can deploy this PR"
+   ```
+   Sans ce label, l'étape `gh pr edit --add-label` de la CI échoue.
 4. **À activer plus tard seulement** : LocalStack, Doppler, le crédit Azure et le domaine Namecheap. Leur compteur démarre à l'activation.
 
 Les secrets ne vont jamais dans le dépôt. Passe-les à Terraform par variables d'environnement :
@@ -90,7 +95,7 @@ export TF_VAR_github_token="..."
 **Terminé quand**
 - [ ] Le compte Datadog est actif et la clé d'API est notée hors du dépôt
 - [ ] Le jeton GitHub existe, en lecture seule
-- [ ] Le label `preview` existe
+- [ ] Le label `preview-ready` existe dans MicroPizzeria
 
 ---
 
@@ -343,9 +348,44 @@ Si la seconde commande réussit, ton CNI n'applique pas les NetworkPolicy. Insta
 
 ## Étape 3 — Mettre en place la CI (semaine 3)
 
-Objectif : chaque PR construit les images, les scanne, scanne l'IaC, et publie les images sur GHCR. Tout échec de scan bloque le pipeline.
+Objectif du MVP : chaque PR construit les trois images de MicroPizzeria et les publie sur GHCR. Les scans (Trivy, Checkov, Gitleaks) viennent **après le MVP**, voir plus bas.
 
-L'image est taguée `pr-<numéro>-<8 premiers caractères du SHA>`. C'est le format que lira ArgoCD. Attention : sur un événement `pull_request`, `GITHUB_SHA` désigne un commit de fusion, pas le dernier commit de la PR. Il faut utiliser `github.event.pull_request.head.sha`.
+### MVP : `.github/workflows/preview.yml` (dans MicroPizzeria)
+
+Le workflow réel est dans le dépôt MicroPizzeria. Ses règles :
+
+| Règle | Détail |
+| --- | --- |
+| Déclencheurs | `pull_request` : `opened`, `synchronize` (nouveau commit), `reopened` |
+| Images | 3 images construites avec les Dockerfiles existants : `frontend`, `user-service`, `order-service`. MySQL et busybox restent les images officielles, jamais reconstruites |
+| Registre | `ghcr.io/sana-benz/micropizzeria-<service>` (GHCR exige des minuscules) |
+| Tags | `pr-<numéro>-<8 premiers caractères du SHA>` (immuable, utilisé par les déploiements) + `pr-<numéro>` (mobile, pour les humains) |
+| Commit construit | `actions/checkout` avec `ref: github.event.pull_request.head.sha` |
+| Lien avec le dépôt | label d'image `org.opencontainers.image.source` (via `docker/metadata-action`) |
+| Feu vert | job `label` (`needs: build`) : ajoute `preview-ready` seulement si les 3 builds ont réussi |
+| Permissions | `packages: write` pour `build`, `pull-requests: write` pour `label` seulement |
+
+**Le contrat de tag** : la CI et ArgoCD calculent le même nom chacun de leur côté, à partir du numéro de PR et du commit de tête. ArgoCD fournit `head_short_sha`, qui fait **8 caractères**. La CI calcule donc `${HEAD_SHA::8}` elle-même, jamais avec `git rev-parse --short` (7 caractères en général).
+
+**Piège du commit de fusion** : sur un événement `pull_request`, `GITHUB_SHA` et le checkout par défaut désignent un commit de fusion temporaire (la PR fusionnée dans `main`), pas le dernier commit de la PR. Or ArgoCD déploie le dernier commit. Il faut utiliser `github.event.pull_request.head.sha` partout : checkout, tag, et label `revision` (`DOCKER_METADATA_PR_HEAD_SHA: true`).
+
+**Une fois, après le tout premier push : vérifier que les packages sont publics.** Le cluster doit pouvoir les tirer sans identifiants. Lors du premier run (PR #4), ils étaient **déjà publics** : hypothèse, un package créé par un workflow d'un dépôt public et lié à ce dépôt en hérite la visibilité. S'ils sont privés, passe chacun des trois en public :
+GitHub → ton profil → **Packages** → `micropizzeria-<service>` → **Package settings** → *Danger Zone* → **Change visibility** → **Public**.
+
+Vérification sans être connecté (le jeton anonyme est toujours délivré, c'est la lecture du manifest qui compte) :
+```bash
+S=frontend; TAG=pr-4-5b6f929c
+T=$(curl -s "https://ghcr.io/token?scope=repository:sana-benz/micropizzeria-$S:pull" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $T" \
+  -H "Accept: application/vnd.oci.image.index.v1+json" \
+  "https://ghcr.io/v2/sana-benz/micropizzeria-$S/manifests/$TAG"     # 200 = public
+```
+
+**Limite connue** : les PR venues d'un fork reçoivent un `GITHUB_TOKEN` en lecture seule. Leurs images ne peuvent pas être publiées, donc elles n'ont pas de preview.
+
+### Après le MVP : scans de sécurité
+
+Exemple de départ, à fusionner avec le workflow du MVP :
 
 ```yaml
 # .github/workflows/ci.yml
@@ -409,10 +449,13 @@ Trois points de sécurité, à citer en entretien :
 
 **Détection de secrets avec Gitleaks** : un job `secret-scan` analyse chaque PR avec Gitleaks et bloque le pipeline si un secret (token, clé, mot de passe) est détecté. Ajoute-le dans les deux dépôts, PRVue et MicroPizzeria. En complément, un hook *pre-commit* local bloque le commit avant même qu'il quitte le laptop. Avec le `.gitignore`, cela fait trois couches de protection : c'est la **défense en profondeur**.
 
-Rends les images publiques dans les réglages de packages GitHub, pour que le cluster puisse les tirer sans identifiants.
+**Terminé quand (MVP)**
+- [ ] Une PR de test produit les 3 images taguées `pr-<numéro>-<sha8>` et `pr-<numéro>` dans GHCR
+- [ ] Les 3 packages sont publics et liés au dépôt MicroPizzeria
+- [ ] La PR reçoit le label `preview-ready`, et seulement si les 3 builds ont réussi
+- [ ] Un nouveau commit produit un nouveau tag `pr-<numéro>-<sha8>`
 
-**Terminé quand**
-- [ ] Une PR de test produit des images taguées dans GHCR
+**Terminé quand (après le MVP)**
 - [ ] Une vulnérabilité volontaire, par exemple une vieille image de base, fait échouer le pipeline
 - [ ] Une erreur Terraform volontaire fait échouer Checkov
 - [ ] Les actions sont épinglées par SHA
@@ -422,7 +465,33 @@ Rends les images publiques dans les réglages de packages GitHub, pour que le cl
 
 ## Étape 4 — Créer un environnement par PR (semaine 4)
 
-Objectif : ouvrir une PR avec le label `preview` crée le namespace `pr-<numéro>` ; la fermer le supprime.
+Objectif : une PR dont les images sont construites (label `preview-ready`) obtient le namespace `pr-<numéro>` ; la fermer le supprime.
+
+**Vérifié dans la documentation d'Argo CD v3.5** (avant d'écrire l'ApplicationSet) :
+- `head_short_sha` fait 8 caractères (`head_short_sha_7` existe aussi : ne pas l'utiliser).
+- Le générateur filtre sur les labels, les branches et le titre, **pas sur le statut de la CI**. D'où le label `preview-ready`.
+- `requeueAfterSeconds` vaut **30 minutes par défaut** : il faut le fixer (ici 120 s).
+- Le contrôleur d'ApplicationSet ajoute lui-même le finalizer `resources-finalizer.argocd.argoproj.io` aux Applications générées : supprimer l'Application supprime ses ressources. À vérifier en phase 5 (`kubectl get application -n argocd pr-<n> -o yaml`).
+- Un namespace créé par `CreateNamespace=true` n'est pas suivi par ArgoCD, donc pas supprimé. C'est pour ça que MicroPizzeria contient son propre `namespace.yaml`.
+- La doc ne dit pas clairement si le générateur GitHub ne liste que les PR ouvertes : à tester en phase 5.
+
+**À respecter en écrivant l'ApplicationSet :**
+- **Jeton GitHub obligatoire (`tokenRef`).** Sans jeton, l'API GitHub limite à 60 requêtes par heure. Avec un passage toutes les 120 s, ça tient, mais sans aucune marge. Avec un jeton : 5 000 par heure.
+- **Toujours fixer `kustomize.namespace: "pr-{{.number}}"`.** Sans lui, Kustomize garde le namespace de base, `micropizzeria`, **partagé par toutes les PR** : fermer une PR supprimerait l'environnement des autres. `missingkey=error` ne protège **pas** contre un oubli de cette ligne : il ne détecte que les variables de template inexistantes (par exemple une faute de frappe dans `{{.numbr}}`).
+- **La vraie protection : un projet ArgoCD dédié (`AppProject`)**. **Testé sur le cluster (2026-11-16)** :
+  ```yaml
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: "pr-*"
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+      name: "pr-*"        # Argo CD v3.5 accepte un motif de nom
+  ```
+  Sans l'override, la synchronisation est **refusée** et rien n'est créé : `namespace micropizzeria is not permitted in project ...; resource :Namespace is not permitted in project ...`. Avec l'override (`pr-98`), elle réussit. ArgoCD vérifie donc le namespace **de chaque ressource**, et le nom de l'objet `Namespace`.
+- Rendu vérifié avec le kustomize d'ArgoCD (v5.8.1, dans le pod `argocd-repo-server`) : avec `edit set namespace pr-99`, les 26 ressources et les sujets des RoleBindings sont dans `pr-99`, l'objet `Namespace` s'appelle `pr-99`, et il ne reste ni `default` ni `micropizzeria`.
+
+**Pas de webhook** : le cluster n'écoute que sur `127.0.0.1`, GitHub ne peut pas le prévenir. Délai attendu entre un push et la mise à jour de la preview = durée de la CI + jusqu'à 120 s (passage du générateur) + éventuellement le délai de réessai du pull d'image (jusqu'à environ 5 minutes si ArgoCD a vu le commit avant la fin de la CI).
 
 Crée d'abord le secret du jeton GitHub, via Terraform avec `TF_VAR_github_token` :
 
@@ -466,28 +535,23 @@ spec:
             secretName: github-token
             key: token
           labels:
-            - preview
-        requeueAfterSeconds: 120
+            - preview-ready          # posé par la CI quand les 3 images existent
+        requeueAfterSeconds: 120     # défaut : 30 minutes
   template:
     metadata:
       name: "pr-{{.number}}"
     spec:
-      project: default
+      project: previews      # AppProject limité à pr-* (voir plus haut), jamais "default"
       source:
         repoURL: https://github.com/<ton-compte>/<ton-depot>.git
-        targetRevision: "{{.head_sha}}"
-        path: deploy/overlays/preview
+        targetRevision: "{{.head_sha}}"   # manifests du même commit que les images
+        path: .                           # kustomization.yaml à la racine de MicroPizzeria
         kustomize:
+          namespace: "pr-{{.number}}"     # en déduit aussi le host et le middleware (replacements)
           images:
-            - "ghcr.io/<ton-compte>/micropizzeria-api:pr-{{.number}}-{{.head_short_sha}}"
-          patches:
-            - target:
-                kind: Ingress
-                name: micropizzeria
-              patch: |-
-                - op: replace
-                  path: /spec/rules/0/host
-                  value: pr-{{.number}}.127.0.0.1.nip.io
+            - "sanabns/frontend=ghcr.io/sana-benz/micropizzeria-frontend:pr-{{.number}}-{{.head_short_sha}}"
+            - "sanabns/user-service=ghcr.io/sana-benz/micropizzeria-user-service:pr-{{.number}}-{{.head_short_sha}}"
+            - "sanabns/order-service=ghcr.io/sana-benz/micropizzeria-order-service:pr-{{.number}}-{{.head_short_sha}}"
       destination:
         server: https://kubernetes.default.svc
         namespace: "pr-{{.number}}"
@@ -503,18 +567,20 @@ Applique-le, puis teste :
 
 ```bash
 kubectl apply -f platform/argocd/applicationset.yaml
-gh pr create --title "test preview" --body "test" --label preview
+gh pr create --title "test preview" --body "test"     # la CI posera preview-ready
 kubectl get applications -n argocd -w
 ```
 
-Si ArgoCD synchronise avant la fin de la CI, les pods restent un moment en `ImagePullBackOff`, puis démarrent dès que l'image existe. C'est normal ; note-le dans une fiche de décision.
+**Limites acceptées pour le MVP** (le label n'est posé qu'une fois, il protège seulement le premier déploiement) :
+- **Commits suivants : `ImagePullBackOff` pendant quelques minutes.** ArgoCD voit le nouveau commit avant que la CI ait publié ses images. Le Deployment démarre le nouveau pod *avant* de supprimer l'ancien (RollingUpdate, aucun Deployment n'utilise `Recreate`) : l'ancienne version continue de répondre. Kubernetes réessaie avec un délai croissant (jusqu'à environ 5 minutes entre deux essais), donc le passage à la nouvelle version peut arriver quelques minutes après la fin de la CI.
+- **Build en échec sur un commit suivant** : l'ancienne version reste en ligne, le nouveau pod reste bloqué, et l'Application apparaît *Degraded* dans ArgoCD. C'est un signal visible ; le commit suivant qui réussit répare tout.
 
 **Terminé quand**
-- [ ] Une PR avec le label `preview` crée `pr-<numéro>` en moins de 5 minutes environ
-- [ ] L'application répond sur `http://pr-<numéro>.127.0.0.1.nip.io`
-- [ ] Un nouveau commit sur la PR redéploie la nouvelle image
+- [ ] Une PR qui reçoit `preview-ready` crée `pr-<numéro>` en moins de 5 minutes environ
+- [ ] L'application répond sur `http://pr-<numéro>.127-0-0-1.nip.io`
+- [ ] Un nouveau commit sur la PR redéploie la nouvelle image, dans le même namespace
 - [ ] Fermer la PR supprime l'application et le namespace
-- [ ] Une PR sans le label ne crée rien
+- [ ] Une PR dont le build a échoué (pas de label) ne crée rien
 
 ---
 
@@ -652,7 +718,7 @@ Relève tes vrais chiffres et remplace ce guide par le README final.
 
 ## Économiser la RAM
 
-- Garde au plus deux PR avec le label `preview` ouvertes en même temps.
+- Garde au plus deux PR ouvertes en même temps : chaque PR dont le build réussit obtient un environnement (environ 1,3 Gio).
 - Arrête le cluster en fin de session avec `terraform destroy`, et recrée-le avec `terraform apply`.
 - Ferme les applications lourdes pendant les sessions de travail.
 - Pour les sessions lourdes, travaille dans GitHub Codespaces, inclus dans le Student Pack, dans la limite de son quota mensuel.
@@ -664,7 +730,7 @@ Relève tes vrais chiffres et remplace ce guide par le README final.
 | Symptôme | Piste |
 | --- | --- |
 | Pods en `ImagePullBackOff` | La CI n'a pas fini, le tag ne correspond pas aux 8 caractères du SHA, ou l'image est privée |
-| Aucun environnement créé | Label `preview` absent, jeton GitHub invalide, ou délai de 2 minutes pas encore écoulé |
+| Aucun environnement créé | Label `preview-ready` absent (build en échec ? label jamais créé ?), jeton GitHub invalide, ou délai de 2 minutes pas encore écoulé |
 | L'URL ne répond pas | Vérifie le port 80 du laptop, le NodePort 30080 de Traefik et l'hôte de l'Ingress |
 | Le test d'isolation réussit alors qu'il devrait échouer | Le CNI n'applique pas les NetworkPolicy |
 | Pods en `Pending` | Quota atteint, ou machine saturée : ferme une PR |

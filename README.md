@@ -14,11 +14,11 @@ When someone proposes a change to an application, the team wants to **see it run
 
 ## The solution
 
-With PRVue, you only need to open a pull request with the `preview` label:
+With PRVue, you only need to open a pull request:
 
-1. CI builds the application images and scans them (vulnerabilities, infrastructure misconfigurations, secrets).
-2. ArgoCD detects the PR and deploys the application into a dedicated namespace, `pr-<number>`.
-3. A health check verifies that the environment responds, then the URL is posted on the PR: `http://pr-42.127.0.0.1.nip.io`.
+1. CI builds the three application images (`frontend`, `user-service`, `order-service`) from the PR's head commit and publishes them to GHCR, tagged `pr-<number>-<first 8 chars of the commit SHA>`. Once all three builds succeed, it adds the `preview-ready` label to the PR. *(Planned after the MVP: blocking scans for vulnerabilities, infrastructure misconfigurations and secrets.)*
+2. ArgoCD detects the PRs labeled `preview-ready` and deploys the application into a dedicated namespace, `pr-<number>`. Every new commit is rebuilt and redeployed into the same namespace.
+3. A health check verifies that the environment responds, then the URL is posted on the PR: `http://pr-42.127-0-0-1.nip.io`.
 4. Datadog monitors the memory, CPU and logs of each environment.
 5. When the PR is closed, the environment is **deleted automatically**.
 
@@ -26,8 +26,9 @@ With PRVue, you only need to open a pull request with the `preview` label:
 
 ```mermaid
 flowchart LR
-    PR[Pull request<br/>on MicroPizzeria] --> CI[GitHub Actions<br/>build + Trivy + Checkov + Gitleaks]
-    CI --> GHCR[(GHCR<br/>image pr-42-abc12345)]
+    PR[Pull request<br/>on MicroPizzeria] --> CI[GitHub Actions<br/>build 3 images]
+    CI --> GHCR[(GHCR<br/>images pr-42-abc12345)]
+    CI -->|label preview-ready| PR
 
     subgraph Laptop["Laptop: kind cluster, created by Terraform"]
         Argo[ArgoCD<br/>ApplicationSet] -->|creates| NS[namespace pr-42<br/>MicroPizzeria + NetworkPolicy + quotas]
@@ -41,6 +42,27 @@ flowchart LR
 ```
 
 **Every connection is outbound from the laptop; nothing comes in.** ArgoCD polls GitHub and the cluster pulls images. Nothing is exposed to the Internet, and port 80 only listens on `127.0.0.1`.
+
+### The tag contract
+
+GitHub Actions and ArgoCD never talk to each other. Both compute the same image name from the same two facts, the PR number and its head commit:
+
+```
+PR #42, head commit abc12345ef…
+  GitHub Actions builds and pushes  ghcr.io/sana-benz/micropizzeria-frontend:pr-42-abc12345
+  ArgoCD deploys                    ghcr.io/sana-benz/micropizzeria-frontend:pr-42-abc12345
+```
+
+Each build also moves a `pr-42` tag to the latest build of the PR, for humans; deployments never use it. Images stay in GHCR after the PR is closed (cleanup is a planned extension).
+
+### Known limitations (MVP)
+
+The `preview-ready` label is added once, after the first successful build, so it only protects the **first** deployment. For later commits, Kubernetes rolling updates keep the previous version online:
+
+- **A new commit can show `ImagePullBackOff` for a few minutes.** ArgoCD may see the commit before CI has published its images. The old pod keeps serving until the new image exists; Kubernetes retries with an increasing delay (up to about 5 minutes between attempts), so the switch can lag behind CI.
+- **A failed build on a later commit** leaves the previous version running and shows the Application as *Degraded* in ArgoCD.
+- **Pull requests from forks** get no preview: their `GITHUB_TOKEN` is read-only, so their images cannot be published.
+- **No webhooks, so updates are not instant.** The cluster only listens on `127.0.0.1`, so GitHub can't notify it; ArgoCD polls GitHub every 120 s (with a GitHub token: anonymous access is limited to 60 requests/hour). Expected delay between a push and the updated preview: CI build time + up to 120 s of polling + possibly the image-pull retry delay (up to about 5 minutes).
 
 ### Two repositories, two roles
 
@@ -80,8 +102,8 @@ This split mirrors how companies work: a platform team provides the tooling, and
 | Step | Content | Status |
 | --- | --- | --- |
 | 1 | Local foundation: kind cluster, Traefik and ArgoCD with Terraform | ✅ |
-| 2 | MicroPizzeria Kustomize manifests, NetworkPolicies, quotas | ⏳ |
-| 3 | CI: build, Trivy, Checkov, Gitleaks, publishing to GHCR | ⏳ |
+| 2 | MicroPizzeria Kustomize manifests (✅), NetworkPolicies and quotas (⏳ after the MVP) | 🟡 |
+| 3 | CI: build the 3 images, publish to GHCR, add `preview-ready` (✅ first run on PR #4); Trivy, Checkov, Gitleaks after the MVP | 🟡 |
 | 4 | One environment per PR with an ArgoCD ApplicationSet | ⏳ |
 | 5 | Post-deployment health check and PR feedback (status + URL) | ⏳ |
 | 6 | Datadog observability: per-environment dashboard and alerts | ⏳ |
@@ -117,7 +139,8 @@ terraform destroy        # removes everything
 │       ├── platform.tf     # Traefik and ArgoCD (Helm charts, pinned versions)
 │       └── values/         # chart settings
 ├── GUIDE.md                # detailed project roadmap (French)
-└── AVANCEMENT.md           # progress log: what was done, and why (French)
+├── AVANCEMENT.md           # progress log: what was done, and why (French)
+└── PROBLEMS.md             # problems, debugging, decisions and concepts
 ```
 
 Coming next: `platform/argocd/applicationset.yaml`, `.github/workflows/`, `docs/adr/` (decision records) and `docs/runbook.md`.

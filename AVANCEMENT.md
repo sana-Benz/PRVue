@@ -182,6 +182,97 @@ curl http://localhost           # "404 page not found" = le chemin complet fonct
 - Vérifier les options d'un chart dans **sa version exacte** : `helm show values traefik/traefik --version 41.6.1`.
 - Une erreur peut cacher la vraie cause : il faut observer l'état réel avant de corriger.
 
+## Fait le 2026-11-16
+
+### 8. Vérification du socle : ArgoCD manquait
+
+Avant de construire le MVP, vérification de ce qui tourne **réellement** :
+
+| Vérification | Résultat |
+| --- | --- |
+| `kubectl get nodes` | `previews-control-plane` Ready ✅ |
+| `curl http://localhost` | `404` : Traefik répond ✅ |
+| `terraform state list` | `kind_cluster.this`, `helm_release.traefik`… mais **pas** `helm_release.argocd` ❌ |
+| `terraform plan` | `Plan: 1 to add` → ArgoCD n'avait jamais été installé |
+
+- Pas de release en échec, pas de namespace `argocd` : rien à nettoyer, l'`apply` n'était simplement jamais allé jusqu'à ArgoCD.
+- Correction : `terraform plan -out=...` puis `terraform apply` **de ce plan précis** (1 ajout, 0 destruction). ArgoCD installé en **48 s**.
+
+**Vérifié :**
+```bash
+kubectl get pods -n argocd                         # 6 pods Running, dont argocd-applicationset-controller
+kubectl get crd | grep argoproj                    # applications, applicationsets, appprojects
+terraform plan -detailed-exitcode                  # code 0 : plus aucune différence
+kubectl -n argocd port-forward svc/argocd-server 8080:443   # https://localhost:8080 → HTTP 200, ArgoCD v3.5.3
+```
+
+**À retenir :** un commit ne prouve pas que l'infrastructure existe. `terraform plan` compare le code à la réalité : s'il propose d'ajouter quelque chose, c'est que ça n'existe pas.
+
+### 9. Manifests de MicroPizzeria pour les previews (Kustomize)
+
+**Choix : réutiliser les fichiers `k8s/` existants sur place, sans dossier `deploy/`.** Un seul `kustomization.yaml` à la racine de MicroPizzeria liste les fichiers là où ils sont. ArgoCD n'a besoin que d'un chemin : `.`.
+
+| Fichier (dans MicroPizzeria) | Changement |
+| --- | --- |
+| `*/k8s/*.yaml`, `rbac.yaml` | **Aucun** |
+| `ingress.yaml` | Modifié : Nginx → Traefik (`ingressClassName: traefik`, chemins `Prefix`, un `host` par environnement, TLS retiré) |
+| `kustomization.yaml` | Nouveau : liste des fichiers + réglages des previews |
+| `namespace.yaml` | Nouveau : le namespace fait partie de l'application, donc ArgoCD pourra le supprimer |
+| `traefik-middleware.yaml` | Nouveau : `stripPrefix /api`, remplace le `rewrite-target` de Nginx |
+
+**Une seule entrée : le namespace.** On change `namespace: micropizzeria` en `pr-12`, et Kustomize en déduit tout le reste :
+- le namespace de chaque ressource (il remplace même les `namespace: default` écrits dans les fichiers, y compris dans les `RoleBinding`) ;
+- le nom de la ressource `Namespace` ;
+- le host `pr-12.127-0-0-1.nip.io` et la référence au middleware `pr-12-strip-api@kubernetescrd` (avec `replacements`).
+
+Autres réglages du `kustomization.yaml` :
+- `secretGenerator` : crée `user-service-secret` et `order-service-secret` avec des valeurs **jetables** (`preview-only-not-a-secret`). Chaque preview a ses propres bases, supprimées avec la PR. Les vrais `secret.yaml` restent hors de Git. `disableNameSuffixHash` garde les noms exacts utilisés par les deployments et `rbac.yaml`.
+- `imagePullPolicy: IfNotPresent` : un tag de preview (`pr-12-abcd1234`) ne change jamais, inutile de le retélécharger.
+- Les images restent `sanabns/*:latest` dans les fichiers ; ArgoCD les remplacera par `ghcr.io/sana-benz/micropizzeria-<service>:pr-<numéro>-<sha>`.
+
+**Test manuel (en simulant ArgoCD)** : copie du dépôt, `namespace: pr-1` (puis `pr-2`) et bloc `images:` ajoutés, images construites en local et chargées avec `kind load docker-image`, puis `kubectl apply -k .`.
+
+| Vérification | Résultat |
+| --- | --- |
+| Pods dans `pr-1` et `pr-2` | 5 + 5 `Running`, 2 PVC `Bound` par namespace |
+| Frontend, CSS, `/api/menu` sur chaque URL | 200, 17 articles |
+| pr-1 : inscription, connexion, `/api/users/me`, commande, historique | 201, 200, 200, 201, 1 commande |
+| Connexion d'alice (créée dans pr-1) sur pr-2 | **401** : bases indépendantes ✅ |
+| Redémarrage de MySQL | Les données restent (PVC) ✅ |
+| `kubectl delete namespace pr-1` | Supprimé en 16 s **avec ses PV** ; pr-2 répond toujours ✅ |
+
+**Incident 1 : nip.io lisait mal l'adresse.** `pr-1.127.0.0.1.nip.io` donnait l'IP `1.127.0.0` : nip.io prend les 4 premiers nombres du nom, et le `1` de `pr-1` en faisait partie. Même problème avec sslip.io. Repéré avec `getent hosts`, et confirmé avec `curl --resolve` (Traefik répondait bien 200). **Correction** : IP écrite avec des tirets, `pr-12.127-0-0-1.nip.io`. README et GUIDE mis à jour.
+
+**Incident 2 : une erreur 500 juste après un redémarrage de MySQL.** Log : `Lost connection to MySQL server`. Le user-service garde des connexions ouvertes vers l'**ancien** pod MySQL ; la première requête échoue, les suivantes marchent. Comportement existant de l'application, pas lié à PRVue. Non corrigé pour le MVP ; correction possible plus tard : `SQLALCHEMY_ENGINE_OPTIONS = {"pool_pre_ping": True}` dans `config.py`.
+
+**À retenir :**
+- Tester une hypothèse sur une copie jetable avant de toucher au vrai dépôt.
+- « Running » ne prouve pas que l'application marche : tester le vrai parcours utilisateur.
+- Quand un test échoue, lire le log avant de conclure.
+
+### 10. Workflow GitHub Actions des images (écrit, pas encore exécuté)
+
+Fichier : `.github/workflows/preview.yml` dans MicroPizzeria. Les décisions sont détaillées dans PROBLEMS.md (D10 à D13).
+
+- 3 images (`frontend`, `user-service`, `order-service`) construites à chaque `opened`, `synchronize`, `reopened`, publiées sur `ghcr.io/sana-benz/micropizzeria-<service>`.
+- Tags : `pr-<numéro>-<8 caractères du SHA>` (immuable) + `pr-<numéro>` (mobile). Checkout et tag à partir de `github.event.pull_request.head.sha`, jamais du commit de fusion.
+- Job `label` (`needs: build`) : ajoute `preview-ready` seulement si les 3 builds réussissent. Le label est posé une fois et jamais retiré.
+
+**Vérifié :**
+- YAML lu par Python : 2 jobs, `label` dépend de `build`, permissions séparées.
+- Calcul du tag en bash : `pr-12-db9fec4c` (8 caractères ; `git rev-parse --short` en donnait 7).
+- Aucun Deployment n'utilise `Recreate` : les 5 sont en `RollingUpdate` (vu sur `pr-2`).
+- Doc Argo CD v3.5 : `head_short_sha` fait 8 caractères ; pas de filtre sur le statut de la CI ; `requeueAfterSeconds` vaut 30 min par défaut ; le finalizer est ajouté par le contrôleur d'ApplicationSet ; un namespace créé par `CreateNamespace=true` n'est pas supprimé.
+
+**Pas encore vérifié :** le workflow n'a jamais tourné (il faut une PR). `actionlint` (outil de vérification des workflows) n'a pas pu être lancé : la commande Docker a été refusée par les permissions de Claude Code.
+
+**À faire avant la PR du workflow :**
+```bash
+gh label create preview-ready -R sana-Benz/MicroPizzeria --color 0E8A16 \
+  --description "Images built: PRVue can deploy this PR"
+```
+Après le premier push : passer les 3 packages GHCR en public (GUIDE, étape 3).
+
 ---
 
 ## Concepts compris
