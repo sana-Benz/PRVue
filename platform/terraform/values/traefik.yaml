@@ -6,3 +6,11 @@ service:
 ports:
   web:
     nodePort: 30080    # the port opened in cluster.tf
+providers:
+  kubernetesIngress:
+    # write 127.0.0.1 in each Ingress status: Argo CD only reports an Ingress Healthy
+    # when its status has an address (a NodePort Service has none to copy)
+    publishedService:
+      enabled: false
+    ingressEndpoint:
+      ip: "127.0.0.1"
