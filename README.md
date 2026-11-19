@@ -12,6 +12,8 @@ Open a pull request → its own preview environment is created automatically →
 
 https://github.com/user-attachments/assets/2e326a77-9fa6-4869-81d7-d73b94acf9d8
 
+Gitleaks detects the secret in seconds; the build, scan and label jobs are skipped, so no image is published and no preview environment is created.
+
 ## How it works
 
 ```mermaid
@@ -93,17 +95,21 @@ Results are uploaded to **code scanning**. For MicroPizzeria they are attached t
 **Supply-chain hardening.** In March 2026, most tags of `aquasecurity/trivy-action` were force-pushed to a credential stealer ([CVE-2026-33634](https://github.com/advisories/GHSA-69fq-xp46-6x23)). So every action is pinned by its full commit SHA, the Gitleaks image by digest, and the Trivy binary by version (never `latest`). Each job gets only the permissions it needs (`permissions: {}` by default), checkouts don't keep the token, workflows never use `pull_request_target`, and Dependabot proposes weekly updates of the pinned actions, configured to wait 14 days after a release (`cooldown`).
 
 ## 🚧 Coming soon
+The MVP and the security gate cover the core lifecycle. These features are next on the roadmap:
 
-The MVP covers the core lifecycle. These features are next on the roadmap:
-
+**Reliability and visibility**
 - Health checks after each deployment, with the preview URL posted on the pull request
-- Monitoring of each preview environment
-- Automatic cleanup of the images of closed pull requests
-- Better secrets management for previews
-- Scheduled weekly scan of the latest images, to catch newly published CVEs even without code changes
-- Harden the MicroPizzeria manifests (non-root, resource limits, securityContext), then make the config scan a gate
-- Move the Python services to `python:3.12-slim` (3.10 is EOL)
+- Monitoring of each preview environment with Prometheus and Grafana (kube-prometheus-stack installed through Terraform): per-preview dashboards for CPU, memory, restarts and HTTP errors
 
+**Security**
+- Harden the MicroPizzeria manifests (non-root, resource limits, securityContext), then make the config scan a gate
+- Scheduled weekly scan of the latest images, to catch newly published CVEs even without code changes
+- Move the Python services to `python:3.12-slim` (3.10 is end of life)
+- Better secrets management for previews
+
+**Housekeeping**
+- Automatic cleanup of the images of closed pull requests
+  
 ## Getting started
 
 **Prerequisites:** Docker, kind, kubectl, Terraform, Helm, and the MicroPizzeria repository with its preview workflow and a `preview-ready` label.
