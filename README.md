@@ -26,7 +26,7 @@ flowchart LR
     User([Browser]) -->|http://pr-n.127-0-0-1.nip.io| Traefik
 ```
 
-1. A pull request on [MicroPizzeria](https://github.com/sana-Benz/MicroPizzeria) triggers GitHub Actions, which builds its three images (`frontend`, `user-service`, `order-service`) from the PR's head commit and pushes them to GHCR as `pr-<number>-<first 8 chars of the SHA>`. Once all three builds succeed, the PR gets the `preview-ready` label.
+1. A pull request on [MicroPizzeria](https://github.com/sana-Benz/MicroPizzeria) triggers GitHub Actions, which builds its three images (`frontend`, `user-service`, `order-service`) from the PR's head commit and pushes them to GHCR as `pr-<number>-<first 8 chars of the SHA>`. Once Gitleaks, the three builds and their Trivy scans succeed, the PR gets the `preview-ready` label (see [Security scanning in CI](#security-scanning-in-ci)).
 2. An Argo CD ApplicationSet (Pull Request generator) lists the open PRs with that label and creates one Application per PR, deployed into its own namespace `pr-<number>`.
 3. Traefik routes `http://pr-<number>.127-0-0-1.nip.io` to that namespace.
 4. A new commit is rebuilt and rolled out in the same namespace; closing the PR deletes the Application, its namespace and its data.
@@ -70,6 +70,24 @@ Instead of writing a toy app, I reused one of my own earlier projects, [MicroPiz
 | **nip.io with a dashed IP** | `pr-12.127-0-0-1.nip.io` resolves to `127.0.0.1` with no DNS setup. The dotted form `pr-12.127.0.0.1.nip.io` is misread by nip.io as `12.127.0.0`. |
 | **kind + Terraform** | A free local cluster, created and destroyed with one command. |
 
+## Security scanning in CI
+
+**On every MicroPizzeria pull request** (`.github/workflows/preview.yml`):
+
+| Check | What is scanned | Blocks the preview? |
+| --- | --- | --- |
+| **Gitleaks** | the PR's commits, for secrets (tokens, API keys, passwords) | **Yes**, any finding |
+| **Trivy** | each of the 3 pushed images, for known vulnerabilities | **Yes** for CRITICAL vulnerabilities that already have a fix; HIGH ones are only reported |
+| **Trivy config** | the rendered Kustomize manifests (what Argo CD applies) and the 3 Dockerfiles, for misconfigurations | **No**, report only for now |
+
+The `preview-ready` label is added only when Gitleaks, the 3 builds and the 3 image scans all pass, so a PR with a leaked secret or a fixable critical vulnerability never gets a preview (tested with a synthetic secret). Its images are still built and pushed, though, because the builds run in parallel with Gitleaks. Unfixed vulnerabilities don't block: no change in the PR could fix them, so blocking would only stop every PR.
+
+**On the PRVue repository** (`.github/workflows/security.yml`, on every push to `main` and every PR): Gitleaks on the whole history, and `trivy config` on `platform/` (Terraform and Argo CD manifests); HIGH and CRITICAL misconfigurations fail the job.
+
+Results are uploaded to **code scanning**. For MicroPizzeria they are attached to each pull request (its checks and the Security tab filtered on that PR), not to `main`: `preview.yml` only runs on pull requests. For PRVue they appear on `main` and on each pull request.
+
+**Supply-chain hardening.** In March 2026, most tags of `aquasecurity/trivy-action` were force-pushed to a credential stealer ([CVE-2026-33634](https://github.com/advisories/GHSA-69fq-xp46-6x23)). So every action is pinned by its full commit SHA, the Gitleaks image by digest, and the Trivy binary by version (never `latest`). Each job gets only the permissions it needs (`permissions: {}` by default), checkouts don't keep the token, workflows never use `pull_request_target`, and Dependabot proposes weekly updates of the pinned actions.
+
 ## 🚧 Coming soon
 
 The MVP covers the core lifecycle. These features are next on the roadmap:
@@ -77,8 +95,10 @@ The MVP covers the core lifecycle. These features are next on the roadmap:
 - Health checks after each deployment, with the preview URL posted on the pull request
 - Monitoring of each preview environment
 - Automatic cleanup of the images of closed pull requests
-- Security scanning in CI (images, infrastructure code, secrets)
 - Better secrets management for previews
+- Scheduled weekly scan of the latest images, to catch newly published CVEs even without code changes
+- Harden the MicroPizzeria manifests (non-root, resource limits, securityContext), then make the config scan a gate
+- Move the Python services to `python:3.12-slim` (3.10 is EOL)
 
 ## Getting started
 
@@ -109,6 +129,9 @@ kubectl get applications -n argocd -w
 
 ```
 .
+├── .github/
+│   ├── workflows/security.yml  # Gitleaks (history) + trivy config (platform/)
+│   └── dependabot.yml          # weekly updates of the pinned actions
 ├── platform/
 │   ├── argocd/
 │   │   ├── appproject.yaml     # "previews" project: pr-* namespaces and MicroPizzeria kinds only
