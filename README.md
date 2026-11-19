@@ -8,6 +8,10 @@ https://github.com/user-attachments/assets/dfcc7ff6-1cc6-4af8-918b-625a0db1dabf
 
 Open a pull request → its own preview environment is created automatically → close the pull request → the environment is deleted.
 
+### Security gate: a PR with a secret is blocked
+
+https://github.com/user-attachments/assets/2e326a77-9fa6-4869-81d7-d73b94acf9d8
+
 ## How it works
 
 ```mermaid
