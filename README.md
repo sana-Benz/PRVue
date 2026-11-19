@@ -80,13 +80,13 @@ Instead of writing a toy app, I reused one of my own earlier projects, [MicroPiz
 | **Trivy** | each of the 3 pushed images, for known vulnerabilities | **Yes** for CRITICAL vulnerabilities that already have a fix; HIGH ones are only reported |
 | **Trivy config** | the rendered Kustomize manifests (what Argo CD applies) and the 3 Dockerfiles, for misconfigurations | **No**, report only for now |
 
-The `preview-ready` label is added only when Gitleaks, the 3 builds and the 3 image scans all pass, so a PR with a leaked secret or a fixable critical vulnerability never gets a preview (tested with a synthetic secret). Its images are still built and pushed, though, because the builds run in parallel with Gitleaks. Unfixed vulnerabilities don't block: no change in the PR could fix them, so blocking would only stop every PR.
+The `preview-ready` label is added only when Gitleaks, the 3 builds and the 3 image scans all pass, so a PR with a leaked secret or a fixable critical vulnerability never gets a preview (tested with a synthetic secret). Its images aren't built either: the builds wait for Gitleaks, so a leaked secret never ends up in a published image. Unfixed vulnerabilities don't block: no change in the PR could fix them, so blocking would only stop every PR.
 
 **On the PRVue repository** (`.github/workflows/security.yml`, on every push to `main` and every PR): Gitleaks on the whole history, and `trivy config` on `platform/` (Terraform and Argo CD manifests); HIGH and CRITICAL misconfigurations fail the job.
 
 Results are uploaded to **code scanning**. For MicroPizzeria they are attached to each pull request (its checks and the Security tab filtered on that PR), not to `main`: `preview.yml` only runs on pull requests. For PRVue they appear on `main` and on each pull request.
 
-**Supply-chain hardening.** In March 2026, most tags of `aquasecurity/trivy-action` were force-pushed to a credential stealer ([CVE-2026-33634](https://github.com/advisories/GHSA-69fq-xp46-6x23)). So every action is pinned by its full commit SHA, the Gitleaks image by digest, and the Trivy binary by version (never `latest`). Each job gets only the permissions it needs (`permissions: {}` by default), checkouts don't keep the token, workflows never use `pull_request_target`, and Dependabot proposes weekly updates of the pinned actions.
+**Supply-chain hardening.** In March 2026, most tags of `aquasecurity/trivy-action` were force-pushed to a credential stealer ([CVE-2026-33634](https://github.com/advisories/GHSA-69fq-xp46-6x23)). So every action is pinned by its full commit SHA, the Gitleaks image by digest, and the Trivy binary by version (never `latest`). Each job gets only the permissions it needs (`permissions: {}` by default), checkouts don't keep the token, workflows never use `pull_request_target`, and Dependabot proposes weekly updates of the pinned actions, configured to wait 14 days after a release (`cooldown`).
 
 ## 🚧 Coming soon
 
